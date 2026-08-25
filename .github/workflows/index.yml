@@ -1,0 +1,48 @@
+name: Build BSVKey name index
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes (GitHub may delay busy crons)
+  workflow_dispatch: {}       # allow manual runs from the Actions tab
+
+permissions:
+  contents: write             # to commit the refreshed docs/names.json
+
+concurrency:
+  group: build-index
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Restore the incremental tx cache so runs don't re-scan the whole registry
+      - uses: actions/cache@v4
+        with:
+          path: .cache
+          key: bsvkey-txcache
+
+      - name: Build index
+        env:
+          NETWORK: main
+          REGISTRY_ADDRESS: 1G6sLZX7FEsho13aei7iVygWaJhrSXDsrM
+          WOC_API_KEY: ${{ secrets.WOC_API_KEY }}   # optional; add in repo Settings → Secrets for faster scans
+        run: node scripts/build-index.js
+
+      - name: Commit refreshed names.json
+        run: |
+          git config user.name "bsvkey-indexer"
+          git config user.email "indexer@bsvkey.local"
+          git add docs/names.json
+          if git diff --cached --quiet; then
+            echo "no changes"
+          else
+            git commit -m "index: refresh names.json"
+            git push
+          fi
