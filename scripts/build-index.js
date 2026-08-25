@@ -57,9 +57,12 @@ function registryRecordFromTx(t){ for (const o of (t.vout || [])){ const hex = (
   if (p[0] !== CHOST_PREFIX) continue
   if (p[1] === 'NAME' && p[2] && p[3]) return { kind: 'name', name: String(p[2]).toLowerCase(), owner: p[3] }
   if (p[1] === 'XFER' && p[2] && p[3]) return { kind: 'xfer', name: String(p[2]).toLowerCase(), newOwner: p[3] } } return null }
+// A page record → {kind:'pub',site} | {kind:'del',site} | null  (DEL = tombstone: owner removed the page)
 function pubRecordFromTx(t){ for (const o of (t.vout || [])){ const hex = ((o.scriptPubKey || {}).hex || '').toLowerCase()
   if (!/^(00)?6a/.test(hex)) continue; const p = scriptPushesFromHex(hex).map(hx)
-  if (p[0] === CHOST_PREFIX && p[1] === 'PUB' && p[2] != null) return { site: (p[4] || '').toLowerCase() } } return null }
+  if (p[0] !== CHOST_PREFIX) continue
+  if (p[1] === 'PUB' && p[2] != null) return { kind: 'pub', site: (p[4] || '').toLowerCase() }
+  if (p[1] === 'DEL') return { kind: 'del', site: (p[2] || '').toLowerCase() } } return null }
 // The address that signed tx `t` (its first input's previous-output address). Authorizes transfers.
 async function signerOfTx(t){ const vin = (t.vin || [])[0]; if (!vin || !vin.txid || vin.vout == null) return null
   try { const prev = await woc(`/tx/hash/${vin.txid}`); const o = (prev.vout || [])[vin.vout]; const a = o && o.scriptPubKey && o.scriptPubKey.addresses; return (a && a[0]) || null } catch { return null } }
@@ -78,17 +81,28 @@ async function signerOfTx(t){ const vin = (t.vin || [])[0]; if (!vin || !vin.txi
   for (const h of reg){ const c = cache.reg[h.txid]; if (!c) continue
     if (c.kind === 'name'){ if (!names[c.name]) names[c.name] = { owner: c.owner, txid: h.txid } }
     else if (c.kind === 'xfer'){ const cur = names[c.name]; if (cur && c.signer && c.signer === cur.owner){ cur.owner = c.newOwner; cur.txid = h.txid } } }
-  // 3) pages per (current) owner
+  // 3) pages per (current) owner — newest record per site wins; a DEL (tombstone) removes it;
+  //    a page counts only if the owner SIGNED the tx (a tx that merely pays the owner — a fee, or
+  //    a spoof — can't seed a page pointer). decided[site]: txid (live) | null (removed).
   const owners = [...new Set(Object.values(names).map(n => n.owner))]
-  const ownerPages = {}
+  const ownerDecided = {}
   for (const owner of owners){ let hist; try { hist = await getHistory(owner) } catch { hist = [] }
-    hist.sort((a, b) => (b.height || 1e12) - (a.height || 1e12))
-    const pg = { default: null, sites: {} }
-    for (const h of hist){ if (!(h.txid in cache.pub)){ try { const t = await woc(`/tx/hash/${h.txid}`); const r = pubRecordFromTx(t); cache.pub[h.txid] = r ? { site: r.site } : false; fetched++ } catch { continue } }
-      const c = cache.pub[h.txid]; if (!c) continue
-      if (c.site){ if (!pg.sites[c.site]) pg.sites[c.site] = h.txid } else if (!pg.default) pg.default = h.txid }
-    ownerPages[owner] = pg }
-  for (const [name, rec] of Object.entries(names)){ const pg = ownerPages[rec.owner] || { default: null, sites: {} }; rec.page = pg.sites[name] || pg.default || null }
+    hist.sort((a, b) => (b.height || 1e12) - (a.height || 1e12))   // newest first
+    const decided = {}
+    for (const h of hist){
+      let c = cache.pub[h.txid]
+      if (c === undefined || (c && c.signer === undefined)){        // uncached, or old-format cache without a signer → (re)fetch to upgrade
+        try { const t = await woc(`/tx/hash/${h.txid}`); const r = pubRecordFromTx(t); c = r ? { kind: r.kind, site: r.site, signer: await signerOfTx(t) } : false; cache.pub[h.txid] = c; fetched++ } catch { continue } }
+      if (!c) continue
+      if (c.signer !== owner) continue                              // only pages this owner actually signed
+      const key = c.site || ''
+      if (key in decided) continue                                  // newest record for this site already decided
+      decided[key] = (c.kind === 'pub') ? h.txid : null             // DEL → removed
+    }
+    ownerDecided[owner] = decided }
+  for (const [name, rec] of Object.entries(names)){ const d = ownerDecided[rec.owner] || {}
+    const own = (name in d) ? d[name] : undefined                   // this name's own page (txid) or removal (null)
+    rec.page = (own !== undefined) ? own : (('' in d) ? d[''] : null) }   // else fall back to the owner's default page
 
   const out = { schema: 'bsvkey-names/3', network: NETWORK, registry: REGISTRY_ADDRESS, updated: new Date().toISOString(), count: Object.keys(names).length, names }
   mkdirp(OUT); fs.writeFileSync(OUT, JSON.stringify(out)); saveCache(cache)
