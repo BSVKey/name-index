@@ -1,9 +1,12 @@
 /*
- * BSVKey static name-index builder (for GitHub Actions).
- * One-shot: scans the on-chain CHOST name registry and writes docs/names.json
- * (a first-claim-wins name -> owner map) which GitHub Pages serves over a CDN.
- * Incremental via a tx cache (.cache/txcache.json) restored by actions/cache.
- * Zero dependencies: Node 18+.
+ * BSVKey static name+page index builder (for GitHub Actions).
+ * Scans the on-chain CHOST name registry (name -> owner, first-claim-wins) AND each
+ * owner's address for published pages, so every name maps directly to its page txid.
+ * Output: docs/names.json  { names: { name: { owner, txid, page } } }
+ *   page = the tx id of the page that name serves (its tagged page, else the owner's
+ *          default/untagged page), or null if the owner hasn't published one yet.
+ * The client then fetches that one transaction — no wallet-history scan needed.
+ * Incremental via a tx cache (.cache/txcache.json). Zero deps: Node 18+.
  */
 'use strict'
 const fs = require('fs')
@@ -20,8 +23,8 @@ const API = `https://api.whatsonchain.com/v1/bsv/${NETWORK}`
 const sleep = (ms) => new Promise(r => setTimeout(r, ms))
 
 function mkdirp(f){ fs.mkdirSync(path.dirname(f), { recursive: true }) }
-function loadCache(){ try { return new Map(Object.entries(JSON.parse(fs.readFileSync(CACHE, 'utf8')))) } catch { return new Map() } }
-function saveCache(m){ mkdirp(CACHE); fs.writeFileSync(CACHE, JSON.stringify(Object.fromEntries(m))) }
+function loadCache(){ try { const j = JSON.parse(fs.readFileSync(CACHE, 'utf8')); return { name: j.name || {}, pub: j.pub || {} } } catch { return { name: {}, pub: {} } } }
+function saveCache(c){ mkdirp(CACHE); fs.writeFileSync(CACHE, JSON.stringify(c)) }
 
 async function woc(p){ const headers = WOC_API_KEY ? { 'woc-api-key': WOC_API_KEY } : {}
   for (let i = 0; i < 5; i++){ const r = await fetch(API + p, { headers })
@@ -54,20 +57,47 @@ const hx = (h) => { try { return Buffer.from(h, 'hex').toString('utf8') } catch 
 function nameRecordFromTx(t){ for (const o of (t.vout || [])){ const hex = ((o.scriptPubKey || {}).hex || '').toLowerCase()
   if (!/^(00)?6a/.test(hex)) continue; const p = scriptPushesFromHex(hex).map(hx)
   if (p[0] === CHOST_PREFIX && p[1] === 'NAME' && p[2] && p[3]) return { name: String(p[2]).toLowerCase(), owner: p[3] } } return null }
+// A PUB tx → { site } (site = the 5th push, '' for the default page); null if not a page publish.
+function pubRecordFromTx(t){ for (const o of (t.vout || [])){ const hex = ((o.scriptPubKey || {}).hex || '').toLowerCase()
+  if (!/^(00)?6a/.test(hex)) continue; const p = scriptPushesFromHex(hex).map(hx)
+  if (p[0] === CHOST_PREFIX && p[1] === 'PUB' && p[2] != null) return { site: (p[4] || '').toLowerCase() } } return null }
 
 ;(async () => {
   const cache = loadCache()
-  const hist = await getHistory(REGISTRY_ADDRESS)
-  hist.sort((a, b) => (a.height || 1e12) - (b.height || 1e12))   // oldest first (first-claim-wins)
+  // 1) name registry → name -> owner (first-claim-wins)
+  const regHist = await getHistory(REGISTRY_ADDRESS)
+  regHist.sort((a, b) => (a.height || 1e12) - (b.height || 1e12))   // oldest first
   let fetched = 0
-  for (const h of hist){ if (cache.has(h.txid)) continue
+  for (const h of regHist){ if (h.txid in cache.name) continue
     try { const t = await woc(`/tx/hash/${h.txid}`); const rec = nameRecordFromTx(t)
-      cache.set(h.txid, rec ? { name: rec.name, owner: rec.owner, height: h.height } : false); fetched++ }
-    catch (e){ /* leave uncached; next run retries */ } }
+      cache.name[h.txid] = rec ? { name: rec.name, owner: rec.owner, height: h.height } : false; fetched++ } catch {} }
   const names = {}
-  for (const h of hist){ const c = cache.get(h.txid); if (c && c.name && !names[c.name]) names[c.name] = { owner: c.owner, txid: h.txid, height: c.height } }
-  const out = { schema: 'bsvkey-names/1', network: NETWORK, registry: REGISTRY_ADDRESS, updated: new Date().toISOString(), count: Object.keys(names).length, names }
+  for (const h of regHist){ const c = cache.name[h.txid]; if (c && c.name && !names[c.name]) names[c.name] = { owner: c.owner, txid: h.txid } }
+
+  // 2) each owner's pages → default (newest untagged) + per-site (newest tagged)
+  const owners = [...new Set(Object.values(names).map(n => n.owner))]
+  const ownerPages = {}
+  for (const owner of owners){
+    let hist; try { hist = await getHistory(owner) } catch { hist = [] }
+    hist.sort((a, b) => (b.height || 1e12) - (a.height || 1e12))   // newest first
+    const pages = { default: null, sites: {} }
+    for (const h of hist){
+      if (!(h.txid in cache.pub)){ try { const t = await woc(`/tx/hash/${h.txid}`); const rec = pubRecordFromTx(t); cache.pub[h.txid] = rec ? { site: rec.site } : false; fetched++ } catch { continue } }
+      const c = cache.pub[h.txid]; if (!c) continue
+      if (c.site){ if (!pages.sites[c.site]) pages.sites[c.site] = h.txid } else if (!pages.default) pages.default = h.txid
+    }
+    ownerPages[owner] = pages
+  }
+
+  // 3) join: each name's page = its tagged page, else the owner's default page
+  for (const [name, rec] of Object.entries(names)){
+    const pg = ownerPages[rec.owner] || { default: null, sites: {} }
+    rec.page = pg.sites[name] || pg.default || null
+  }
+
+  const out = { schema: 'bsvkey-names/2', network: NETWORK, registry: REGISTRY_ADDRESS, updated: new Date().toISOString(), count: Object.keys(names).length, names }
   mkdirp(OUT); fs.writeFileSync(OUT, JSON.stringify(out))
   saveCache(cache)
-  console.log(`wrote ${OUT}: ${out.count} names (${fetched} new tx fetched, ${cache.size} cached)`)
+  const withPage = Object.values(names).filter(n => n.page).length
+  console.log(`wrote ${OUT}: ${out.count} names (${withPage} with a page), ${owners.length} owners, ${fetched} new tx fetched`)
 })().catch(e => { console.error(e); process.exit(1) })

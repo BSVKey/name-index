@@ -1,9 +1,17 @@
 # BSVKey name index — on GitHub (Actions + Pages)
 
-A **free, serverless** name indexer for BSVKey. A scheduled GitHub Action scans the
-on-chain CHOST name registry and publishes a static **`docs/names.json`** (first-claim-wins
-`name → owner` map) which **GitHub Pages** serves over a CDN. BSVKey reads it for instant
-name lookups and still falls back to a trustless on-chain scan if it's unavailable.
+A **free, serverless** name+page indexer for BSVKey. A scheduled GitHub Action scans the
+on-chain CHOST name registry **and each owner's published pages**, then publishes a static
+**`docs/names.json`** which **GitHub Pages** serves over a CDN:
+
+```json
+{ "schema": "bsvkey-names/2", "names": {
+    "myname": { "owner": "1Addr…", "txid": "<name-claim tx>", "page": "<page tx or null>" } } }
+```
+
+Because each name carries its **`page`** transaction id, BSVKey resolves a site in **one
+fetch** (name → page tx → HTML) instead of scanning a wallet's whole history. It still
+falls back to a trustless on-chain scan if the index is unavailable.
 
 No server, no dependencies (Node 18+ built-in `fetch`).
 
