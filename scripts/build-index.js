@@ -66,6 +66,20 @@ function pubRecordFromTx(t){ for (const o of (t.vout || [])){ const hex = ((o.sc
 // The address that signed tx `t` (its first input's previous-output address). Authorizes transfers.
 async function signerOfTx(t){ const vin = (t.vin || [])[0]; if (!vin || !vin.txid || vin.vout == null) return null
   try { const prev = await woc(`/tx/hash/${vin.txid}`); const o = (prev.vout || [])[vin.vout]; const a = o && o.scriptPubKey && o.scriptPubKey.addresses; return (a && a[0]) || null } catch { return null } }
+// OP_RETURN scripts straight from a raw tx hex — WhatsOnChain's decoded endpoint truncates
+// scriptPubKey.hex at 100000 chars (~50 KB), hiding the site tag of any page bigger than that.
+function rawOutScripts(raw){ raw = String(raw || '').toLowerCase(); const rev = (h) => (h.match(/../g) || []).reverse().join('')
+  function vi(i){ const f = parseInt(raw.substr(i, 2), 16); i += 2; if (f < 0xfd) return [f, i]; if (f === 0xfd) return [parseInt(rev(raw.substr(i, 4)), 16), i + 4]; if (f === 0xfe) return [parseInt(rev(raw.substr(i, 8)), 16), i + 8]; return [Number(BigInt('0x' + rev(raw.substr(i, 16)))), i + 16] }
+  const scripts = []; try { let i = 8; let [vin, a] = vi(i); i = a; for (let k = 0; k < vin; k++){ i += 64 + 8; const [sl, j] = vi(i); i = j + sl * 2 + 8 } let [vout, b] = vi(i); i = b; for (let k = 0; k < vout; k++){ i += 16; const [sl, j] = vi(i); const s = raw.substr(j, sl * 2); i = j + sl * 2; if (/^(00)?6a/.test(s)) scripts.push(s) } } catch {} return scripts }
+// pubRecordFromTx, but re-reads the full raw tx when the decoded script hex looks truncated, so large pages still expose their site tag.
+async function pageRecordFull(txid, t){
+  const capped = (t.vout || []).some(o => (((o.scriptPubKey || {}).hex || '').length >= 100000))
+  const r = pubRecordFromTx(t); if (r && !capped) return r
+  if (capped){ try { const raw = await woc(`/tx/${txid}/hex`)
+    for (const s of rawOutScripts(raw)){ const p = scriptPushesFromHex(s).map(hx); if (p[0] !== CHOST_PREFIX) continue
+      if (p[1] === 'PUB' && p[2] != null) return { kind: 'pub', site: (p[4] || '').toLowerCase() }
+      if (p[1] === 'DEL') return { kind: 'del', site: (p[2] || '').toLowerCase() } } } catch {} }
+  return r }
 
 ;(async () => {
   const cache = loadCache()
@@ -92,7 +106,7 @@ async function signerOfTx(t){ const vin = (t.vin || [])[0]; if (!vin || !vin.txi
     for (const h of hist){
       let c = cache.pub[h.txid]
       if (c === undefined || (c && c.signer === undefined)){        // uncached, or old-format cache without a signer → (re)fetch to upgrade
-        try { const t = await woc(`/tx/hash/${h.txid}`); const r = pubRecordFromTx(t); c = r ? { kind: r.kind, site: r.site, signer: await signerOfTx(t) } : false; cache.pub[h.txid] = c; fetched++ } catch { continue } }
+        try { const t = await woc(`/tx/hash/${h.txid}`); const r = await pageRecordFull(h.txid, t); c = r ? { kind: r.kind, site: r.site, signer: await signerOfTx(t) } : false; cache.pub[h.txid] = c; fetched++ } catch { continue } }
       if (!c) continue
       if (c.signer !== owner) continue                              // only pages this owner actually signed
       const key = c.site || ''
