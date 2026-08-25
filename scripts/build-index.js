@@ -1,17 +1,14 @@
 /*
- * BSVKey static name+page index builder (for GitHub Actions).
- * Scans the on-chain CHOST name registry (name -> owner, first-claim-wins) AND each
- * owner's address for published pages, so every name maps directly to its page txid.
+ * BSVKey static name+page index builder (GitHub Actions).
+ * Scans the on-chain CHOST registry: NAME claims (first-claim-wins) + XFER transfers
+ * (honoured only if signed by the then-current owner) + each owner's published pages.
  * Output: docs/names.json  { names: { name: { owner, txid, page } } }
- *   page = the tx id of the page that name serves (its tagged page, else the owner's
- *          default/untagged page), or null if the owner hasn't published one yet.
- * The client then fetches that one transaction — no wallet-history scan needed.
+ *   owner = current owner after any transfers; txid = the record that set it;
+ *   page  = the tx of the page that name serves (tagged page, else owner's default), or null.
  * Incremental via a tx cache (.cache/txcache.json). Zero deps: Node 18+.
  */
 'use strict'
-const fs = require('fs')
-const path = require('path')
-
+const fs = require('fs'); const path = require('path')
 const NETWORK = (process.env.NETWORK || 'main') === 'test' ? 'test' : 'main'
 const REGISTRY_ADDRESS = process.env.REGISTRY_ADDRESS || '1G6sLZX7FEsho13aei7iVygWaJhrSXDsrM'
 const WOC_API_KEY = process.env.WOC_API_KEY || ''
@@ -23,7 +20,7 @@ const API = `https://api.whatsonchain.com/v1/bsv/${NETWORK}`
 const sleep = (ms) => new Promise(r => setTimeout(r, ms))
 
 function mkdirp(f){ fs.mkdirSync(path.dirname(f), { recursive: true }) }
-function loadCache(){ try { const j = JSON.parse(fs.readFileSync(CACHE, 'utf8')); return { name: j.name || {}, pub: j.pub || {} } } catch { return { name: {}, pub: {} } } }
+function loadCache(){ try { const j = JSON.parse(fs.readFileSync(CACHE, 'utf8')); return { reg: j.reg || {}, pub: j.pub || {} } } catch { return { reg: {}, pub: {} } } }
 function saveCache(c){ mkdirp(CACHE); fs.writeFileSync(CACHE, JSON.stringify(c)) }
 
 async function woc(p){ const headers = WOC_API_KEY ? { 'woc-api-key': WOC_API_KEY } : {}
@@ -54,50 +51,46 @@ function scriptPushesFromHex(hex){ const s = String(hex || '').toLowerCase(); co
     pushes.push(s.substr(i, len * 2)); i += len * 2 }
   return pushes }
 const hx = (h) => { try { return Buffer.from(h, 'hex').toString('utf8') } catch { return '' } }
-function nameRecordFromTx(t){ for (const o of (t.vout || [])){ const hex = ((o.scriptPubKey || {}).hex || '').toLowerCase()
+// A registry tx → {kind:'name',name,owner} | {kind:'xfer',name,newOwner} | null
+function registryRecordFromTx(t){ for (const o of (t.vout || [])){ const hex = ((o.scriptPubKey || {}).hex || '').toLowerCase()
   if (!/^(00)?6a/.test(hex)) continue; const p = scriptPushesFromHex(hex).map(hx)
-  if (p[0] === CHOST_PREFIX && p[1] === 'NAME' && p[2] && p[3]) return { name: String(p[2]).toLowerCase(), owner: p[3] } } return null }
-// A PUB tx → { site } (site = the 5th push, '' for the default page); null if not a page publish.
+  if (p[0] !== CHOST_PREFIX) continue
+  if (p[1] === 'NAME' && p[2] && p[3]) return { kind: 'name', name: String(p[2]).toLowerCase(), owner: p[3] }
+  if (p[1] === 'XFER' && p[2] && p[3]) return { kind: 'xfer', name: String(p[2]).toLowerCase(), newOwner: p[3] } } return null }
 function pubRecordFromTx(t){ for (const o of (t.vout || [])){ const hex = ((o.scriptPubKey || {}).hex || '').toLowerCase()
   if (!/^(00)?6a/.test(hex)) continue; const p = scriptPushesFromHex(hex).map(hx)
   if (p[0] === CHOST_PREFIX && p[1] === 'PUB' && p[2] != null) return { site: (p[4] || '').toLowerCase() } } return null }
+// The address that signed tx `t` (its first input's previous-output address). Authorizes transfers.
+async function signerOfTx(t){ const vin = (t.vin || [])[0]; if (!vin || !vin.txid || vin.vout == null) return null
+  try { const prev = await woc(`/tx/hash/${vin.txid}`); const o = (prev.vout || [])[vin.vout]; const a = o && o.scriptPubKey && o.scriptPubKey.addresses; return (a && a[0]) || null } catch { return null } }
 
 ;(async () => {
   const cache = loadCache()
-  // 1) name registry → name -> owner (first-claim-wins)
-  const regHist = await getHistory(REGISTRY_ADDRESS)
-  regHist.sort((a, b) => (a.height || 1e12) - (b.height || 1e12))   // oldest first
+  // 1) registry records (NAME + XFER), oldest first
+  const reg = await getHistory(REGISTRY_ADDRESS); reg.sort((a, b) => (a.height || 1e12) - (b.height || 1e12))
   let fetched = 0
-  for (const h of regHist){ if (h.txid in cache.name) continue
-    try { const t = await woc(`/tx/hash/${h.txid}`); const rec = nameRecordFromTx(t)
-      cache.name[h.txid] = rec ? { name: rec.name, owner: rec.owner, height: h.height } : false; fetched++ } catch {} }
+  for (const h of reg){ if (h.txid in cache.reg) continue
+    try { const t = await woc(`/tx/hash/${h.txid}`); const rec = registryRecordFromTx(t); fetched++
+      if (rec && rec.kind === 'xfer') rec.signer = await signerOfTx(t)   // resolve signer now (needs the tx)
+      cache.reg[h.txid] = rec || false } catch {} }
+  // 2) apply ownership: first NAME = original owner; each XFER applies only if signed by current owner
   const names = {}
-  for (const h of regHist){ const c = cache.name[h.txid]; if (c && c.name && !names[c.name]) names[c.name] = { owner: c.owner, txid: h.txid } }
-
-  // 2) each owner's pages → default (newest untagged) + per-site (newest tagged)
+  for (const h of reg){ const c = cache.reg[h.txid]; if (!c) continue
+    if (c.kind === 'name'){ if (!names[c.name]) names[c.name] = { owner: c.owner, txid: h.txid } }
+    else if (c.kind === 'xfer'){ const cur = names[c.name]; if (cur && c.signer && c.signer === cur.owner){ cur.owner = c.newOwner; cur.txid = h.txid } } }
+  // 3) pages per (current) owner
   const owners = [...new Set(Object.values(names).map(n => n.owner))]
   const ownerPages = {}
-  for (const owner of owners){
-    let hist; try { hist = await getHistory(owner) } catch { hist = [] }
-    hist.sort((a, b) => (b.height || 1e12) - (a.height || 1e12))   // newest first
-    const pages = { default: null, sites: {} }
-    for (const h of hist){
-      if (!(h.txid in cache.pub)){ try { const t = await woc(`/tx/hash/${h.txid}`); const rec = pubRecordFromTx(t); cache.pub[h.txid] = rec ? { site: rec.site } : false; fetched++ } catch { continue } }
+  for (const owner of owners){ let hist; try { hist = await getHistory(owner) } catch { hist = [] }
+    hist.sort((a, b) => (b.height || 1e12) - (a.height || 1e12))
+    const pg = { default: null, sites: {} }
+    for (const h of hist){ if (!(h.txid in cache.pub)){ try { const t = await woc(`/tx/hash/${h.txid}`); const r = pubRecordFromTx(t); cache.pub[h.txid] = r ? { site: r.site } : false; fetched++ } catch { continue } }
       const c = cache.pub[h.txid]; if (!c) continue
-      if (c.site){ if (!pages.sites[c.site]) pages.sites[c.site] = h.txid } else if (!pages.default) pages.default = h.txid
-    }
-    ownerPages[owner] = pages
-  }
+      if (c.site){ if (!pg.sites[c.site]) pg.sites[c.site] = h.txid } else if (!pg.default) pg.default = h.txid }
+    ownerPages[owner] = pg }
+  for (const [name, rec] of Object.entries(names)){ const pg = ownerPages[rec.owner] || { default: null, sites: {} }; rec.page = pg.sites[name] || pg.default || null }
 
-  // 3) join: each name's page = its tagged page, else the owner's default page
-  for (const [name, rec] of Object.entries(names)){
-    const pg = ownerPages[rec.owner] || { default: null, sites: {} }
-    rec.page = pg.sites[name] || pg.default || null
-  }
-
-  const out = { schema: 'bsvkey-names/2', network: NETWORK, registry: REGISTRY_ADDRESS, updated: new Date().toISOString(), count: Object.keys(names).length, names }
-  mkdirp(OUT); fs.writeFileSync(OUT, JSON.stringify(out))
-  saveCache(cache)
-  const withPage = Object.values(names).filter(n => n.page).length
-  console.log(`wrote ${OUT}: ${out.count} names (${withPage} with a page), ${owners.length} owners, ${fetched} new tx fetched`)
+  const out = { schema: 'bsvkey-names/3', network: NETWORK, registry: REGISTRY_ADDRESS, updated: new Date().toISOString(), count: Object.keys(names).length, names }
+  mkdirp(OUT); fs.writeFileSync(OUT, JSON.stringify(out)); saveCache(cache)
+  console.log(`wrote ${OUT}: ${out.count} names, ${owners.length} owners, ${fetched} new tx fetched`)
 })().catch(e => { console.error(e); process.exit(1) })

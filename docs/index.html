@@ -1,24 +1,32 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>BSVKey name index</title>
-<style>body{font:15px/1.6 system-ui,Segoe UI,Roboto,sans-serif;max-width:640px;margin:48px auto;padding:0 20px;background:#0e1116;color:#e8ebf1}
+<style>body{font:15px/1.6 system-ui,Segoe UI,Roboto,sans-serif;max-width:680px;margin:48px auto;padding:0 20px;background:#0e1116;color:#e8ebf1}
 h1{color:#2dd4bf;font-size:22px}a{color:#5eead4}code{background:#161b22;padding:2px 6px;border-radius:6px}
-input{background:#0f1319;border:1px solid #252c37;border-radius:8px;color:#e8ebf1;padding:9px 11px;width:60%}
+input{background:#0f1319;border:1px solid #252c37;border-radius:8px;color:#e8ebf1;padding:9px 11px;width:58%}
 button{background:#2dd4bf;color:#04201c;border:0;border-radius:8px;padding:9px 14px;font-weight:700;cursor:pointer}
-#out{margin-top:14px;font:13px ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap}</style></head>
+#out{margin-top:14px;font:13px ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;line-height:1.7}
+.k{color:#8b97ab}</style></head>
 <body>
 <h1>BSVKey name index</h1>
-<p>A static, CDN-served snapshot of the on-chain CHOST name registry (first-claim-wins). Machine-readable map: <a href="names.json">names.json</a>.</p>
+<p>A static, CDN-served snapshot of the on-chain CHOST registry: <b>name → owner → page</b>, first-claim-wins, transfer-aware. Machine-readable: <a href="names.json">names.json</a>.</p>
 <p><input id="q" placeholder="look up a name, e.g. wallet"><button id="b">Resolve</button></p>
 <div id="out">loading…</div>
 <script>
 let idx=null
+const WOC="https://whatsonchain.com/tx/", APP="https://bsvkey.com/#site="
 fetch('names.json',{cache:'no-cache'}).then(r=>r.json()).then(j=>{idx=j;
-  document.getElementById('out').textContent=j.count+' names · updated '+j.updated+' · registry '+j.registry})
-  .catch(e=>document.getElementById('out').textContent='could not load names.json')
+  document.getElementById('out').innerHTML=`<span class="k">schema ${j.schema||'?'} · ${j.count} names · updated ${j.updated}\nregistry ${j.registry}</span>`})
+  .catch(()=>document.getElementById('out').textContent='could not load names.json')
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 function go(){const n=(document.getElementById('q').value||'').trim().toLowerCase();const o=document.getElementById('out')
   if(!idx){o.textContent='index not loaded yet';return}
-  const r=idx.names[n];o.textContent=r?(n+' → '+r.owner+'  (tx '+r.txid.slice(0,16)+'…)'):'“'+n+'” is not claimed'}
+  const r=idx.names[n]
+  if(!r){o.innerHTML=`<b>${esc(n)}</b> — <span class="k">not claimed</span>`;return}
+  let h=`<b>${esc(n)}</b>\n<span class="k">owner</span> ${esc(r.owner)}\n<span class="k">record</span> <a href="${WOC}${r.txid}" target="_blank">${r.txid.slice(0,20)}…</a>\n`
+  h+= r.page ? `<span class="k">page</span>  <a href="${WOC}${r.page}" target="_blank">${r.page.slice(0,20)}…</a>\n<span class="k">open</span>  <a href="${APP}${encodeURIComponent(n)}" target="_blank">bsvkey.com/#site=${esc(n)}</a>`
+             : `<span class="k">page</span>  (none published yet)`
+  o.innerHTML=h}
 document.getElementById('b').onclick=go
 document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')go()})
 </script>
