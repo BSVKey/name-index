@@ -1,6 +1,9 @@
 name: Build BSVKey name index
 
 on:
+concurrency:
+  group: build-index
+  cancel-in-progress: false
   schedule:
     - cron: "*/5 * * * *"   # every 5 minutes (GitHub may delay busy crons)
   workflow_dispatch: {}       # allow manual runs from the Actions tab
@@ -36,13 +39,15 @@ jobs:
         run: node scripts/build-index.js
 
       - name: Commit refreshed names.json
-        run: |
-          git config user.name "bsvkey-indexer"
-          git config user.email "indexer@bsvkey.local"
-          git add docs/names.json
-          if git diff --cached --quiet; then
-            echo "no changes"
-          else
-            git commit -m "index: refresh names.json"
-            git push
-          fi
+    name: Commit refreshed names.json
+  run: |
+    git config user.name "bsvkey-indexer"
+    git config user.email "indexer@bsvkey.com"
+    git add docs/names.json
+    if git diff --cached --quiet; then echo "no changes"; exit 0; fi
+    git commit -m "index: refresh names.json"
+    for i in 1 2 3 4 5; do
+      git pull --rebase --autostash origin main && git push origin main && exit 0
+      echo "push rejected, retrying ($i)"; sleep $((RANDOM % 5 + 2))
+    done
+    echo "push failed after retries"; exit 1
