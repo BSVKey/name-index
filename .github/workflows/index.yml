@@ -1,25 +1,25 @@
 name: Build BSVKey name index
 
 on:
+  schedule:
+    - cron: "*/5 * * * *"      # every 5 minutes (GitHub may delay busy crons)
+  workflow_dispatch: {}         # allow manual runs from the Actions tab
+
+# Only one indexer run at a time, so two runs never race to push main.
 concurrency:
   group: build-index
   cancel-in-progress: false
-  schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes (GitHub may delay busy crons)
-  workflow_dispatch: {}       # allow manual runs from the Actions tab
 
 permissions:
-  contents: write             # to commit the refreshed docs/names.json
-
-concurrency:
-  group: build-index
-  cancel-in-progress: false
+  contents: write               # to commit the refreshed docs/names.json
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # full history so `git pull --rebase` works
 
       - uses: actions/setup-node@v4
         with:
@@ -39,15 +39,19 @@ jobs:
         run: node scripts/build-index.js
 
       - name: Commit refreshed names.json
-    name: Commit refreshed names.json
-  run: |
-    git config user.name "bsvkey-indexer"
-    git config user.email "indexer@bsvkey.com"
-    git add docs/names.json
-    if git diff --cached --quiet; then echo "no changes"; exit 0; fi
-    git commit -m "index: refresh names.json"
-    for i in 1 2 3 4 5; do
-      git pull --rebase --autostash origin main && git push origin main && exit 0
-      echo "push rejected, retrying ($i)"; sleep $((RANDOM % 5 + 2))
-    done
-    echo "push failed after retries"; exit 1
+        run: |
+          git config user.name "bsvkey-indexer"
+          git config user.email "indexer@bsvkey.local"
+          git add docs/names.json
+          if git diff --cached --quiet; then
+            echo "no changes"
+            exit 0
+          fi
+          git commit -m "index: refresh names.json"
+          for i in 1 2 3 4 5; do
+            git pull --rebase --autostash origin main && git push origin main && exit 0
+            echo "push rejected, retrying ($i)..."
+            sleep $((RANDOM % 5 + 2))
+          done
+          echo "push failed after retries"
+          exit 1
