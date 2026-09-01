@@ -42,14 +42,26 @@ jobs:
         run: |
           git config user.name "bsvkey-indexer"
           git config user.email "indexer@bsvkey.local"
-          git add docs/names.json
-          if git diff --cached --quiet; then
-            echo "no changes"
-            exit 0
-          fi
-          git commit -m "index: refresh names.json"
+          # names.json is a fully regenerated artifact, so a concurrent run's push
+          # can never be "merged" with ours — rebasing it just conflicts (both runs
+          # rewrite the same single line). Instead, on each attempt we move onto the
+          # latest remote and re-place OUR freshly built file on top. Last writer
+          # wins, no merge, no conflict — so overlapping runs can't fail the job.
+          cp docs/names.json "$RUNNER_TEMP/names.json"
           for i in 1 2 3 4 5; do
-            git pull --rebase --autostash origin main && git push origin main && exit 0
+            git fetch origin main
+            git reset --hard origin/main
+            cp "$RUNNER_TEMP/names.json" docs/names.json
+            git add docs/names.json
+            if git diff --cached --quiet; then
+              echo "no changes (remote already current)"
+              exit 0
+            fi
+            git commit -m "index: refresh names.json"
+            if git push origin main; then
+              echo "pushed"
+              exit 0
+            fi
             echo "push rejected, retrying ($i)..."
             sleep $((RANDOM % 5 + 2))
           done
