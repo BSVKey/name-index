@@ -1,10 +1,15 @@
 /*
  * BSVKey static name+page index builder (GitHub Actions).
  * Scans the on-chain CHOST registry: NAME claims (first-claim-wins) + XFER transfers
- * (honoured only if signed by the then-current owner) + each owner's published pages.
- * Output: docs/names.json  { names: { name: { owner, txid, page } } }
- *   owner = current owner after any transfers; txid = the record that set it;
- *   page  = the tx of the page that name serves (tagged page, else owner's default), or null.
+ * (honoured only if signed by the then-current owner) + Name Market LIST / SALE / DELIST
+ * records + each owner's published pages.
+ * Output: docs/names.json  { names: { name: { owner, txid, page, lock? } } }
+ *   owner = current owner after any transfers/sales; txid = the record that set it;
+ *   page  = the tx of the page that name serves (tagged page, else owner's default), or null;
+ *   lock  = { txid, vout, expiry, height } while the name is listed for sale.
+ * Market rules (same as bsvkey.com mkt-core.js): a LIST makes vout 2 a 1-sat lock coin; while the
+ * lock is live (record height <= expiry) ownership only moves via a record whose input 0 spends it.
+ * SALE: input 0 spends the lock, new owner = signer of input 1. DELIST clears the lock.
  * Incremental via a tx cache (.cache/txcache.json). Zero deps: Node 18+.
  */
 'use strict'
@@ -51,12 +56,35 @@ function scriptPushesFromHex(hex){ const s = String(hex || '').toLowerCase(); co
     pushes.push(s.substr(i, len * 2)); i += len * 2 }
   return pushes }
 const hx = (h) => { try { return Buffer.from(h, 'hex').toString('utf8') } catch { return '' } }
-// A registry tx → {kind:'name',name,owner} | {kind:'xfer',name,newOwner} | null
+// A registry tx → {kind:'name',name,owner} | {kind:'xfer',name,newOwner} | {kind:'list',name,expiry} | {kind:'sale',name,price} | {kind:'delist',name} | null
 function registryRecordFromTx(t){ for (const o of (t.vout || [])){ const hex = ((o.scriptPubKey || {}).hex || '').toLowerCase()
   if (!/^(00)?6a/.test(hex)) continue; const p = scriptPushesFromHex(hex).map(hx)
   if (p[0] !== CHOST_PREFIX) continue
-  if (p[1] === 'NAME' && p[2] && p[3]) return { kind: 'name', name: String(p[2]).toLowerCase(), owner: p[3] }
-  if (p[1] === 'XFER' && p[2] && p[3]) return { kind: 'xfer', name: String(p[2]).toLowerCase(), newOwner: p[3] } } return null }
+  const name = String(p[2] || '').toLowerCase()
+  if (p[1] === 'NAME' && name && p[3]) return { kind: 'name', name, owner: p[3] }
+  if (p[1] === 'XFER' && name && p[3]) return { kind: 'xfer', name, newOwner: p[3] }
+  if (p[1] === 'LIST' && name && /^\d+$/.test(p[3] || '')) return { kind: 'list', name, expiry: parseInt(p[3], 10) }
+  if (p[1] === 'SALE' && name) return { kind: 'sale', name, price: parseInt(p[3], 10) || 0 }
+  if (p[1] === 'DELIST' && name) return { kind: 'delist', name } } return null }
+const LOCK_VOUT = 2
+// Apply one registry record (rules identical to bsvkey.com mkt-core.js applyRecord).
+function applyRecord(names, r){ const cur = names[r.name]
+  if (r.kind === 'name'){ if (!cur) names[r.name] = { owner: r.owner, txid: r.txid, lock: null }; return }
+  if (!cur || !r.signer0 || r.signer0 !== cur.owner) return                       // only the current owner acts
+  const spendsLock = !!(cur.lock && r.spends0 === cur.lock.txid + ':' + cur.lock.vout)
+  const lockLive = !!(cur.lock && r.height <= cur.lock.expiry)
+  if (lockLive && !spendsLock) return                                              // listed: only via the lock coin
+  if (r.kind === 'sale'){ if (spendsLock && r.signer1){ cur.owner = r.signer1; cur.txid = r.txid; cur.lock = null } return }
+  if (r.kind === 'xfer'){ cur.owner = r.newOwner; cur.txid = r.txid; cur.lock = null; return }
+  if (r.kind === 'delist'){ cur.lock = null; return }
+  if (r.kind === 'list'){ cur.lock = { txid: r.txid, vout: LOCK_VOUT, expiry: r.expiry, height: r.height } } }
+// Height order, but a record whose input 0 spends another registry tx goes after it (same block).
+function orderRecords(recs){ const ids = new Set(recs.map(r => r.txid)); const done = new Set(); const waiting = new Map(); const out = []
+  const emit = (r) => { out.push(r); done.add(r.txid); const w = waiting.get(r.txid); if (w){ waiting.delete(r.txid); w.forEach(emit) } }
+  for (const r of recs){ const parent = r.spends0 ? r.spends0.split(':')[0] : null
+    if (parent && parent !== r.txid && ids.has(parent) && !done.has(parent)){ if (!waiting.has(parent)) waiting.set(parent, []); waiting.get(parent).push(r) } else emit(r) }
+  for (const w of waiting.values()) w.forEach(emit)
+  return out }
 // A page record → {kind:'pub',site} | {kind:'del',site} | null  (DEL = tombstone: owner removed the page)
 function pubRecordFromTx(t){ for (const o of (t.vout || [])){ const hex = ((o.scriptPubKey || {}).hex || '').toLowerCase()
   if (!/^(00)?6a/.test(hex)) continue; const p = scriptPushesFromHex(hex).map(hx)
@@ -64,7 +92,7 @@ function pubRecordFromTx(t){ for (const o of (t.vout || [])){ const hex = ((o.sc
   if (p[1] === 'PUB' && p[2] != null) return { kind: 'pub', site: (p[4] || '').toLowerCase() }
   if (p[1] === 'DEL') return { kind: 'del', site: (p[2] || '').toLowerCase() } } return null }
 // The address that signed tx `t` (its first input's previous-output address). Authorizes transfers.
-async function signerOfTx(t){ const vin = (t.vin || [])[0]; if (!vin || !vin.txid || vin.vout == null) return null
+async function signerOfTx(t, i = 0){ const vin = (t.vin || [])[i]; if (!vin || !vin.txid || vin.vout == null) return null
   try { const prev = await woc(`/tx/hash/${vin.txid}`); const o = (prev.vout || [])[vin.vout]; const a = o && o.scriptPubKey && o.scriptPubKey.addresses; return (a && a[0]) || null } catch { return null } }
 // OP_RETURN scripts straight from a raw tx hex — WhatsOnChain's decoded endpoint truncates
 // scriptPubKey.hex at 100000 chars (~50 KB), hiding the site tag of any page bigger than that.
@@ -88,13 +116,19 @@ async function pageRecordFull(txid, t){
   let fetched = 0
   for (const h of reg){ if (h.txid in cache.reg) continue
     try { const t = await woc(`/tx/hash/${h.txid}`); const rec = registryRecordFromTx(t); fetched++
-      if (rec && rec.kind === 'xfer') rec.signer = await signerOfTx(t)   // resolve signer now (needs the tx)
+      if (rec && rec.kind !== 'name'){                                    // resolve signers now (needs the tx)
+        rec.signer = await signerOfTx(t, 0)
+        const v0 = (t.vin || [])[0]; rec.spends0 = (v0 && v0.txid) ? v0.txid + ':' + v0.vout : null
+        if (rec.kind === 'sale') rec.signer1 = await signerOfTx(t, 1) }
       cache.reg[h.txid] = rec || false } catch {} }
-  // 2) apply ownership: first NAME = original owner; each XFER applies only if signed by current owner
+  // 2) apply ownership: first NAME = original owner; XFER / LIST / SALE / DELIST only by the current
+  //    owner, and while a name is listed only through its lock coin (see applyRecord)
   const names = {}
+  const recs = []
   for (const h of reg){ const c = cache.reg[h.txid]; if (!c) continue
-    if (c.kind === 'name'){ if (!names[c.name]) names[c.name] = { owner: c.owner, txid: h.txid } }
-    else if (c.kind === 'xfer'){ const cur = names[c.name]; if (cur && c.signer && c.signer === cur.owner){ cur.owner = c.newOwner; cur.txid = h.txid } } }
+    recs.push(Object.assign({}, c, { txid: h.txid, height: h.height || 0, signer0: c.signer })) }
+  for (const r of orderRecords(recs)) applyRecord(names, r)
+  for (const rec of Object.values(names)){ if (!rec.lock) delete rec.lock }
   // 3) pages per (current) owner — newest record per site wins; a DEL (tombstone) removes it;
   //    a page counts only if the owner SIGNED the tx (a tx that merely pays the owner — a fee, or
   //    a spoof — can't seed a page pointer). decided[site]: txid (live) | null (removed).
@@ -118,7 +152,9 @@ async function pageRecordFull(txid, t){
     const own = (name in d) ? d[name] : undefined                   // this name's own page (txid) or removal (null)
     rec.page = (own !== undefined) ? own : (('' in d) ? d[''] : null) }   // else fall back to the owner's default page
 
-  const out = { schema: 'bsvkey-names/3', network: NETWORK, registry: REGISTRY_ADDRESS, updated: new Date().toISOString(), count: Object.keys(names).length, names }
+  // height = newest registry block scanned; clients replay registry txs at >= height to catch up
+  const height = reg.reduce((m, h) => Math.max(m, h.height || 0), 0)
+  const out = { schema: 'bsvkey-names/3', network: NETWORK, registry: REGISTRY_ADDRESS, updated: new Date().toISOString(), height, count: Object.keys(names).length, names }
   mkdirp(OUT); fs.writeFileSync(OUT, JSON.stringify(out)); saveCache(cache)
   console.log(`wrote ${OUT}: ${out.count} names, ${owners.length} owners, ${fetched} new tx fetched`)
 })().catch(e => { console.error(e); process.exit(1) })
