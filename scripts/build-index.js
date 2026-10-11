@@ -6,7 +6,9 @@
  * Output: docs/names.json  { names: { name: { owner, txid, page, lock? } } }
  *   owner = current owner after any transfers/sales; txid = the record that set it;
  *   page  = the tx of the page that name serves (tagged page, else owner's default), or null;
- *   lock  = { txid, vout, expiry, height } while the name is listed for sale.
+ *   lock  = { txid, vout, expiry, height, offer? } while the name is listed for sale; offer = { txid, hex }
+ *           is the seller's signed half of the sale from an on-chain OFFER record, so the market's
+ *           order book can always be rebuilt from the chain (and from this file).
  * Market rules (same as bsvkey.com mkt-core.js): a LIST makes vout 2 a 1-sat lock coin; while the
  * lock is live (record height <= expiry) ownership only moves via a record whose input 0 spends it.
  * SALE: input 0 spends the lock, new owner = signer of input 1. DELIST clears the lock.
@@ -65,7 +67,19 @@ function registryRecordFromTx(t){ for (const o of (t.vout || [])){ const hex = (
   if (p[1] === 'XFER' && name && p[3]) return { kind: 'xfer', name, newOwner: p[3] }
   if (p[1] === 'LIST' && name && /^\d+$/.test(p[3] || '')) return { kind: 'list', name, expiry: parseInt(p[3], 10) }
   if (p[1] === 'SALE' && name) return { kind: 'sale', name, price: parseInt(p[3], 10) || 0 }
-  if (p[1] === 'DELIST' && name) return { kind: 'delist', name } } return null }
+  if (p[1] === 'DELIST' && name) return { kind: 'delist', name }
+  if (p[1] === 'OFFER' && name && /^[0-9a-f]{100,}$/i.test(p[3] || '')) return { kind: 'offer', name, offerHex: String(p[3]).toLowerCase() } } return null }
+// Input 0 outpoint ('txid:vout') of a raw tx hex.
+function offerOutpoint(hex){ const h = String(hex || ''); let i = 8
+  const f = parseInt(h.substr(i, 2), 16); i += f < 0xfd ? 2 : f === 0xfd ? 6 : f === 0xfe ? 10 : 18
+  const txid = (h.substr(i, 64).match(/../g) || []).reverse().join(''); i += 64
+  const vout = parseInt((h.substr(i, 8).match(/../g) || []).reverse().join(''), 16)
+  return txid.length === 64 ? txid + ':' + vout : null }
+// OFFER: kept only if signed by the current owner and it spends the name's live lock (same as mkt-core attachOffer).
+function attachOffer(names, r){ const cur = names[r.name]
+  if (!cur || !cur.lock || r.signer0 !== cur.owner) return
+  if (offerOutpoint(r.offerHex) !== cur.lock.txid + ':' + cur.lock.vout) return
+  cur.lock.offer = { txid: r.txid, hex: r.offerHex } }
 const LOCK_VOUT = 2
 // Apply one registry record (rules identical to bsvkey.com mkt-core.js applyRecord).
 function applyRecord(names, r){ const cur = names[r.name]
@@ -127,7 +141,7 @@ async function pageRecordFull(txid, t){
   const recs = []
   for (const h of reg){ const c = cache.reg[h.txid]; if (!c) continue
     recs.push(Object.assign({}, c, { txid: h.txid, height: h.height || 0, signer0: c.signer })) }
-  for (const r of orderRecords(recs)) applyRecord(names, r)
+  for (const r of orderRecords(recs)){ if (r.kind === 'offer') attachOffer(names, r); else applyRecord(names, r) }
   for (const rec of Object.values(names)){ if (!rec.lock) delete rec.lock }
   // 3) pages per (current) owner — newest record per site wins; a DEL (tombstone) removes it;
   //    a page counts only if the owner SIGNED the tx (a tx that merely pays the owner — a fee, or
