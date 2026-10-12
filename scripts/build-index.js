@@ -36,15 +36,17 @@ async function woc(p){ const headers = WOC_API_KEY ? { 'woc-api-key': WOC_API_KE
     if (!r.ok) throw new Error(r.status + ' ' + p)
     await sleep(THROTTLE_MS); const t = await r.text(); try { return JSON.parse(t) } catch { return t } }
   throw new Error('rate-limited: ' + p) }
+// Full confirmed history via the paginated endpoint. No fallback to the legacy /history: it returns
+// only the newest 100 txs, and on 2026-10-12 a transient error here sent a run down that path and
+// published an index of 30 names instead of 114. A failure now aborts the run, so the last good
+// names.json stays live.
 async function getHistory(addr){
-  try { let out = [], token = null, guard = 0
-    do { const j = await woc(`/address/${addr}/confirmed/history?limit=100${token ? '&token=' + token : ''}`)
-      const rows = Array.isArray(j) ? j : (j.result || [])
-      out = out.concat(rows.map(r => ({ txid: r.tx_hash, height: r.height || 0 })))
-      token = (j && j.nextPageToken) || null } while (token && ++guard < 1000000)
-    if (out.length) return out } catch {}
-  const j = await woc(`/address/${addr}/history`); const rows = Array.isArray(j) ? j : (j.result || [])
-  return rows.map(r => ({ txid: r.tx_hash, height: r.height || 0 })) }
+  let out = [], token = null, guard = 0
+  do { const j = await woc(`/address/${addr}/confirmed/history?limit=1000${token ? '&token=' + token : ''}`)
+    if (!j || !Array.isArray(j.result)) throw new Error('unexpected history response for ' + addr)
+    out = out.concat(j.result.map(r => ({ txid: r.tx_hash, height: r.height || 0 })))
+    token = j.nextPageToken || null } while (token && ++guard < 10000)
+  return out }
 
 function scriptPushesFromHex(hex){ const s = String(hex || '').toLowerCase(); const pushes = []; let i = 0, saw = false
   while (i + 2 <= s.length){ const op = parseInt(s.substr(i, 2), 16); i += 2
@@ -148,7 +150,7 @@ async function pageRecordFull(txid, t){
   //    a spoof — can't seed a page pointer). decided[site]: txid (live) | null (removed).
   const owners = [...new Set(Object.values(names).map(n => n.owner))]
   const ownerDecided = {}
-  for (const owner of owners){ let hist; try { hist = await getHistory(owner) } catch { hist = [] }
+  for (const owner of owners){ const hist = await getHistory(owner)
     hist.sort((a, b) => (b.height || 1e12) - (a.height || 1e12))   // newest first
     const decided = {}
     for (const h of hist){
@@ -169,6 +171,9 @@ async function pageRecordFull(txid, t){
   // height = newest registry block scanned; clients replay registry txs at >= height to catch up
   const height = reg.reduce((m, h) => Math.max(m, h.height || 0), 0)
   const out = { schema: 'bsvkey-names/3', network: NETWORK, registry: REGISTRY_ADDRESS, updated: new Date().toISOString(), height, count: Object.keys(names).length, names }
+  // Claims are permanent, so a run that finds fewer names than the live index is a bad read, not news.
+  let prevCount = 0; try { prevCount = JSON.parse(fs.readFileSync(OUT, 'utf8')).count || 0 } catch {}
+  if (out.count < prevCount && !process.env.ALLOW_SHRINK) throw new Error(`refusing to publish ${out.count} names (live index has ${prevCount}); set ALLOW_SHRINK=1 to override`)
   mkdirp(OUT); fs.writeFileSync(OUT, JSON.stringify(out)); saveCache(cache)
   console.log(`wrote ${OUT}: ${out.count} names, ${owners.length} owners, ${fetched} new tx fetched`)
 })().catch(e => { console.error(e); process.exit(1) })
