@@ -25,11 +25,14 @@ jobs:
         with:
           node-version: "20"
 
-      # Restore the incremental tx cache so runs don't re-scan the whole registry
-      - uses: actions/cache@v4
+      # Restore the incremental tx cache so runs don't re-scan the whole registry.
+      # Cache keys are immutable, so each run saves under a new key and restores
+      # the newest one by prefix (a fixed key froze the cache at its first save).
+      - uses: actions/cache/restore@v4
         with:
           path: .cache
-          key: bsvkey-txcache
+          key: bsvkey-txcache-${{ github.run_id }}
+          restore-keys: bsvkey-txcache-
 
       - name: Build index
         env:
@@ -37,6 +40,14 @@ jobs:
           REGISTRY_ADDRESS: 1G6sLZX7FEsho13aei7iVygWaJhrSXDsrM
           WOC_API_KEY: ${{ secrets.WOC_API_KEY }}   # optional; add in repo Settings → Secrets for faster scans
         run: node scripts/build-index.js
+
+      # Save even when the build fails, so a slow or partial scan still makes
+      # progress for the next run instead of starting over.
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .cache
+          key: bsvkey-txcache-${{ github.run_id }}
 
       - name: Commit refreshed names.json
         run: |

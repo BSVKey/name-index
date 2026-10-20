@@ -173,7 +173,8 @@ async function pageRecordFull(txid, t){
   const out = { schema: 'bsvkey-names/3', network: NETWORK, registry: REGISTRY_ADDRESS, updated: new Date().toISOString(), height, count: Object.keys(names).length, names }
   // Claims are permanent, so a run that finds fewer names than the live index is a bad read, not news.
   let prevCount = 0; try { prevCount = JSON.parse(fs.readFileSync(OUT, 'utf8')).count || 0 } catch {}
-  if (out.count < prevCount && !process.env.ALLOW_SHRINK) throw new Error(`refusing to publish ${out.count} names (live index has ${prevCount}); set ALLOW_SHRINK=1 to override`)
+  // The cache holds only successful fetches, so keep it even when refusing: the next run retries just the misses.
+  if (out.count < prevCount && !process.env.ALLOW_SHRINK){ saveCache(cache); throw new Error(`refusing to publish ${out.count} names (live index has ${prevCount}); set ALLOW_SHRINK=1 to override`) }
   mkdirp(OUT); fs.writeFileSync(OUT, JSON.stringify(out)); saveCache(cache)
   console.log(`wrote ${OUT}: ${out.count} names, ${owners.length} owners, ${fetched} new tx fetched`)
 })().catch(e => { console.error(e); process.exit(1) })
