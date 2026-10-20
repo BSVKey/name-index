@@ -19,7 +19,7 @@ const fs = require('fs'); const path = require('path')
 const NETWORK = (process.env.NETWORK || 'main') === 'test' ? 'test' : 'main'
 const REGISTRY_ADDRESS = process.env.REGISTRY_ADDRESS || '1G6sLZX7FEsho13aei7iVygWaJhrSXDsrM'
 const WOC_API_KEY = process.env.WOC_API_KEY || ''
-const THROTTLE_MS = parseInt(process.env.THROTTLE_MS || (WOC_API_KEY ? '110' : '150'), 10)   // ~9 req/s fits the 10 req/s paid plan; set THROTTLE_MS for faster plans
+const THROTTLE_MS = parseInt(process.env.THROTTLE_MS || (WOC_API_KEY ? '300' : '150'), 10)   // with a key, stay under the free tier's 3 req/s; set THROTTLE_MS for paid plans
 const OUT = process.env.OUT || 'docs/names.json'
 const CACHE = process.env.CACHE || '.cache/txcache.json'
 const CHOST_PREFIX = 'CHOSTv1'
