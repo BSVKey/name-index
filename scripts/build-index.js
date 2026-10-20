@@ -19,7 +19,7 @@ const fs = require('fs'); const path = require('path')
 const NETWORK = (process.env.NETWORK || 'main') === 'test' ? 'test' : 'main'
 const REGISTRY_ADDRESS = process.env.REGISTRY_ADDRESS || '1G6sLZX7FEsho13aei7iVygWaJhrSXDsrM'
 const WOC_API_KEY = process.env.WOC_API_KEY || ''
-const THROTTLE_MS = parseInt(process.env.THROTTLE_MS || (WOC_API_KEY ? '40' : '150'), 10)
+const THROTTLE_MS = parseInt(process.env.THROTTLE_MS || (WOC_API_KEY ? '110' : '150'), 10)   // ~9 req/s fits the 10 req/s paid plan; set THROTTLE_MS for faster plans
 const OUT = process.env.OUT || 'docs/names.json'
 const CACHE = process.env.CACHE || '.cache/txcache.json'
 const CHOST_PREFIX = 'CHOSTv1'
@@ -30,7 +30,7 @@ function mkdirp(f){ fs.mkdirSync(path.dirname(f), { recursive: true }) }
 function loadCache(){ try { const j = JSON.parse(fs.readFileSync(CACHE, 'utf8')); return { reg: j.reg || {}, pub: j.pub || {} } } catch { return { reg: {}, pub: {} } } }
 function saveCache(c){ mkdirp(CACHE); fs.writeFileSync(CACHE, JSON.stringify(c)) }
 
-async function woc(p){ const headers = WOC_API_KEY ? { 'woc-api-key': WOC_API_KEY } : {}
+async function woc(p){ const headers = WOC_API_KEY ? { Authorization: WOC_API_KEY } : {}   // per docs.whatsonchain.com: raw key, no prefix
   for (let i = 0; i < 5; i++){ const r = await fetch(API + p, { headers })
     if (r.status === 429){ await sleep(1500 * (i + 1)); continue }
     if (!r.ok) throw new Error(r.status + ' ' + p)
