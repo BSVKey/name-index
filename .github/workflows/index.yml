@@ -17,18 +17,18 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0        # full history so `git pull --rebase` works
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: "20"
 
       # Restore the incremental tx cache so runs don't re-scan the whole registry.
       # Cache keys are immutable, so each run saves under a new key and restores
       # the newest one by prefix (a fixed key froze the cache at its first save).
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@v5
         with:
           path: .cache
           key: bsvkey-txcache-${{ github.run_id }}
@@ -43,7 +43,7 @@ jobs:
 
       # Save even when the build fails, so a slow or partial scan still makes
       # progress for the next run instead of starting over.
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@v5
         if: always()
         with:
           path: .cache
